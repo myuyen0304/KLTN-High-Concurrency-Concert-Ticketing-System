@@ -1,0 +1,358 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+enum UserStatus {
+  PENDING_VERIFY
+  ACTIVE
+  LOCKED
+}
+
+enum RoleName {
+  USER
+  ORGANIZER
+  ADMIN
+}
+
+enum OrganizerStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum EventStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  ACTIVE
+  LOCKED
+  CANCELLED
+  ENDED
+}
+
+enum TicketModelType {
+  SEAT_MAP
+  ZONE
+}
+
+enum SeatStatus {
+  AVAILABLE
+  LOCKED
+  SOLD
+}
+
+enum SeatLockStatus {
+  ACTIVE
+  RELEASED
+  EXPIRED
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  EXPIRED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  REFUNDED
+}
+
+enum TicketStatus {
+  ISSUED
+  USED
+  CANCELLED
+}
+
+// ─── Identity (BC1) ──────────────────────────────────────────────────────────
+
+model User {
+  id           String     @id @default(uuid())
+  email        String     @unique
+  passwordHash String
+  fullName     String
+  phone        String?
+  avatarUrl    String?
+  status       UserStatus @default(PENDING_VERIFY)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  roles            UserRole[]
+  organizerProfile OrganizerProfile?
+  orders           Order[]
+  notifications    Notification[]
+  auditLogs        AuditLog[]
+
+  @@map("users")
+}
+
+model Role {
+  id   String   @id @default(uuid())
+  name RoleName @unique
+
+  userRoles UserRole[]
+
+  @@map("roles")
+}
+
+model UserRole {
+  id         String   @id @default(uuid())
+  userId     String
+  roleId     String
+  assignedAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id])
+
+  @@unique([userId, roleId])
+  @@map("user_roles")
+}
+
+// ─── Event Management (BC2) ──────────────────────────────────────────────────
+
+model OrganizerProfile {
+  id           String          @id @default(uuid())
+  userId       String          @unique
+  orgName      String
+  description  String?
+  logoUrl      String?
+  bannerUrl    String?
+  website      String?
+  contactEmail String?
+  contactPhone String?
+  status       OrganizerStatus @default(PENDING)
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  events Event[]
+
+  @@map("organizer_profiles")
+}
+
+model Event {
+  id                String           @id @default(uuid())
+  organizerId       String
+  title             String
+  description       String?
+  category          String?
+  startTime         DateTime
+  endTime           DateTime
+  venue             String?
+  bannerUrl         String?
+  status            EventStatus      @default(DRAFT)
+  ticketModel       TicketModelType?
+  maxTicketsPerUser Int              @default(4)
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  organizer   OrganizerProfile @relation(fields: [organizerId], references: [id])
+  ticketTypes TicketType[]
+  seats       Seat[]
+  zones       Zone[]
+  waitingRoom WaitingRoom?
+  orders      Order[]
+
+  @@map("events")
+}
+
+model TicketType {
+  id            String   @id @default(uuid())
+  eventId       String
+  name          String
+  price         Decimal  @db.Decimal(10, 2)
+  quantity      Int
+  sold          Int      @default(0)
+  saleStartTime DateTime
+  saleEndTime   DateTime
+  description   String?
+  isHidden      Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  event      Event       @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  seats      Seat[]
+  orderItems OrderItem[]
+
+  @@map("ticket_types")
+}
+
+model Zone {
+  id           String   @id @default(uuid())
+  eventId      String
+  name         String
+  capacity     Int
+  ticketTypeId String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@map("zones")
+}
+
+model Seat {
+  id           String     @id @default(uuid())
+  eventId      String
+  ticketTypeId String?
+  zoneId       String?
+  row          String?
+  number       String?
+  label        String?
+  status       SeatStatus @default(AVAILABLE)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  event      Event       @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  ticketType TicketType? @relation(fields: [ticketTypeId], references: [id])
+  seatLocks  SeatLock[]
+  orderItems OrderItem[]
+  ticket     Ticket?
+
+  @@map("seats")
+}
+
+// ─── Queue & Concurrency (BC3) ────────────────────────────────────────────────
+
+model WaitingRoom {
+  id            String    @id @default(uuid())
+  eventId       String    @unique
+  isOpen        Boolean   @default(false)
+  maxConcurrent Int       @default(100)
+  bookingWindow Int       @default(600)
+  openAt        DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@map("waiting_rooms")
+}
+
+model SeatLock {
+  id         String         @id @default(uuid())
+  seatId     String
+  userId     String
+  lockedAt   DateTime       @default(now())
+  expiresAt  DateTime
+  releasedAt DateTime?
+  status     SeatLockStatus @default(ACTIVE)
+
+  seat Seat @relation(fields: [seatId], references: [id])
+
+  @@map("seat_locks")
+}
+
+// ─── Booking & Order (BC4) ────────────────────────────────────────────────────
+
+model Order {
+  id             String      @id @default(uuid())
+  userId         String
+  eventId        String
+  idempotencyKey String      @unique
+  status         OrderStatus @default(PENDING)
+  totalAmount    Decimal     @db.Decimal(10, 2)
+  expiresAt      DateTime
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  user               User               @relation(fields: [userId], references: [id])
+  event              Event              @relation(fields: [eventId], references: [id])
+  orderItems         OrderItem[]
+  paymentTransaction PaymentTransaction?
+  tickets            Ticket[]
+
+  @@map("orders")
+}
+
+model OrderItem {
+  id           String   @id @default(uuid())
+  orderId      String
+  seatId       String?
+  ticketTypeId String
+  quantity     Int      @default(1)
+  unitPrice    Decimal  @db.Decimal(10, 2)
+  createdAt    DateTime @default(now())
+
+  order      Order      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  seat       Seat?      @relation(fields: [seatId], references: [id])
+  ticketType TicketType @relation(fields: [ticketTypeId], references: [id])
+
+  @@map("order_items")
+}
+
+// ─── Payment (BC5) ────────────────────────────────────────────────────────────
+
+model PaymentTransaction {
+  id             String        @id @default(uuid())
+  orderId        String        @unique
+  gatewayTxId    String?
+  gateway        String
+  amount         Decimal       @db.Decimal(10, 2)
+  status         PaymentStatus @default(PENDING)
+  idempotencyKey String        @unique
+  callbackPayload Json?
+  processedAt    DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id])
+
+  @@map("payment_transactions")
+}
+
+model Ticket {
+  id       String       @id @default(uuid())
+  orderId  String
+  seatId   String       @unique
+  qrCode   String       @unique
+  status   TicketStatus @default(ISSUED)
+  issuedAt DateTime     @default(now())
+  usedAt   DateTime?
+
+  order Order @relation(fields: [orderId], references: [id])
+  seat  Seat  @relation(fields: [seatId], references: [id])
+
+  @@map("tickets")
+}
+
+// ─── Notification & Audit (BC6 / Cross-cutting) ───────────────────────────────
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String
+  title     String
+  body      String
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("notifications")
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  userId     String?
+  action     String
+  resource   String?
+  resourceId String?
+  ipAddress  String?
+  userAgent  String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@map("audit_logs")
+}
