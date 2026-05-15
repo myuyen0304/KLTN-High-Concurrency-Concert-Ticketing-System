@@ -9,7 +9,7 @@ import {
 import { JwtService } from '@nestjs/jwt';
 import { RoleName, UserStatus } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
-import { randomUUID } from 'crypto';
+import { randomInt, randomUUID } from 'crypto';
 import { JwtPayload } from '../common/decorators/current-user.decorator';
 import { PrismaService } from '../prisma/prisma.service';
 import { RedisService } from '../redis/redis.service';
@@ -288,19 +288,20 @@ export class AuthService {
   // ─── Helpers ─────────────────────────────────────────────────────────────
 
   private async generateAndStoreOtp(email: string): Promise<void> {
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otp = randomInt(100000, 1000000).toString();
     // key format theo docs/redis-keys.md: otp:{email} → {code}:{attempts} TTL 300s
     await this.redis.set(`otp:${email}`, `${otp}:0`, OTP_TTL);
 
     // TODO: gửi qua email service (nodemailer / SES)
-    // Trong môi trường dev: log OTP ra console
-    console.log(`[DEV OTP] ${email} → ${otp}`);
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`[DEV OTP] ${email} → ${otp}`);
+    }
   }
 
   private async incrementLoginFail(failKey: string): Promise<void> {
     const newCount = await this.redis.incr(failKey);
-    // Set TTL khi lần fail đầu tiên hoặc khi đạt giới hạn (để đảm bảo lock đủ 15 phút)
-    if (newCount === 1 || newCount >= LOGIN_MAX_FAILS) {
+    // Chỉ set TTL ở lần fail đầu tiên — tránh attacker kéo dài lock vô thời hạn
+    if (newCount === 1) {
       await this.redis.expire(failKey, LOGIN_LOCK_TTL);
     }
   }
