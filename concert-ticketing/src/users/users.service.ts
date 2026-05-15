@@ -7,6 +7,7 @@ import {
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
+import { randomInt } from 'crypto';
 import { RoleName, UserStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { RedisService } from '../redis/redis.service';
@@ -114,7 +115,7 @@ export class UsersService {
     });
     if (conflict) throw new ConflictException('Email này đã được sử dụng');
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otp = randomInt(100000, 1000000).toString();
     // Lưu: newEmail|otp|attempts (dùng | vì email không chứa ký tự này)
     await this.redis.set(
       `otp:email-change:${userId}`,
@@ -123,7 +124,9 @@ export class UsersService {
     );
 
     // TODO: gửi email đến dto.newEmail
-    console.log(`[DEV OTP email-change] ${dto.newEmail} → ${otp}`);
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`[DEV OTP email-change] ${dto.newEmail} → ${otp}`);
+    }
 
     return { message: 'OTP xác nhận đã được gửi đến email mới.' };
   }
