@@ -90,6 +90,7 @@ model User {
   roles            UserRole[]
   organizerProfile OrganizerProfile?
   orders           Order[]
+  seatLocks        SeatLock[]
   notifications    Notification[]
   auditLogs        AuditLog[]
 
@@ -182,6 +183,7 @@ model TicketType {
 
   event      Event       @relation(fields: [eventId], references: [id], onDelete: Cascade)
   seats      Seat[]
+  zones      Zone[]
   orderItems OrderItem[]
 
   @@map("ticket_types")
@@ -196,7 +198,8 @@ model Zone {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  event      Event       @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  ticketType TicketType? @relation(fields: [ticketTypeId], references: [id])
 
   @@map("zones")
 }
@@ -217,7 +220,7 @@ model Seat {
   ticketType TicketType? @relation(fields: [ticketTypeId], references: [id])
   seatLocks  SeatLock[]
   orderItems OrderItem[]
-  ticket     Ticket?
+  tickets    Ticket[]
 
   @@map("seats")
 }
@@ -249,6 +252,7 @@ model SeatLock {
   status     SeatLockStatus @default(ACTIVE)
 
   seat Seat @relation(fields: [seatId], references: [id])
+  user User @relation(fields: [userId], references: [id])
 
   @@map("seat_locks")
 }
@@ -314,7 +318,7 @@ model PaymentTransaction {
 model Ticket {
   id       String       @id @default(uuid())
   orderId  String
-  seatId   String       @unique
+  seatId   String
   qrCode   String       @unique
   status   TicketStatus @default(ISSUED)
   issuedAt DateTime     @default(now())
