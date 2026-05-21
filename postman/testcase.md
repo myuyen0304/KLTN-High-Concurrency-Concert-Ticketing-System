@@ -737,6 +737,231 @@
 
 ---
 
+## Module: Seat Lock (UC09)
+
+> **Bối cảnh:** Module booking lõi — giành ghế nguyên tử qua Lua trên Redis (atomicity ở Lua, không phải application code), audit ghi Postgres sau. Yêu cầu `Authorization: Bearer {{TOKEN}}` cho cả 2 endpoint.
+>
+> **Chuẩn bị seat thật:**
+> - Đã chạy xong TC-EVENT, TC-TICKET, TC-SEAT-02 (đã có 50 ghế A1..E10).
+> - Mở Prisma Studio (`npx prisma studio`) → bảng `seats` → copy 5 `id` UUID khác nhau vào biến Postman:
+>   - `SEAT_ID_1`, `SEAT_ID_2`, `SEAT_ID_3`, `SEAT_ID_4`, `SEAT_ID_5` (đủ chạm MAX=4)
+> - Cần thêm 1 user nữa để test 409 SEAT_TAKEN — đăng ký user2 (TC-AUTH-02 + verify-otp) → login → lưu `TOKEN_2`.
+> - Env vars cần có khi `npm run start:dev`: `MAX_SEATS_PER_USER=4`.
+
+### TC-LOCK-01 — Khóa ghế thành công
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/booking/seats/{{SEAT_ID_1}}/lock` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Body (JSON) | `{ "eventId": "{{EVENT_ID}}" }` |
+| Status | `200 OK` |
+| Response | `{ "lockId": "uuid", "seatId": "{{SEAT_ID_1}}", "expiresAt": "2026-05-21T13:21:00.000Z" }` |
+| Ghi chú | `expiresAt` = now + 15 phút. Lưu `lockId` để dùng cho TC khác nếu cần. |
+| Verify Redis | `KEYS lock:event:{{EVENT_ID}}:seat:{{SEAT_ID_1}}` → 1 key, value = userId của TOKEN, TTL ~900 |
+| Verify DB | `SELECT * FROM seat_locks WHERE seat_id = '{{SEAT_ID_1}}'` → 1 row status=ACTIVE |
+
+---
+
+### TC-LOCK-02 — Khóa ghế đã bị người khác giữ (SEAT_TAKEN)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/booking/seats/{{SEAT_ID_1}}/lock` |
+| Header | `Authorization: Bearer {{TOKEN_2}}` |
+| Body (JSON) | `{ "eventId": "{{EVENT_ID}}" }` |
+| Điều kiện | Chạy sau TC-LOCK-01 (ghế đang bị TOKEN giữ) |
+| Status | `409 Conflict` |
+| Response | `{ "statusCode": 409, "message": { "code": "SEAT_TAKEN", "message": "Seat ... is already locked by another user" }, "path": "/api/v1/booking/seats/.../lock", "timestamp": "..." }` |
+| Verify | Lock key trên Redis vẫn thuộc về user 1, không bị overwrite |
+
+---
+
+### TC-LOCK-03 — Khóa lại chính ghế mình đang giữ (idempotent)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/booking/seats/{{SEAT_ID_1}}/lock` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Body (JSON) | `{ "eventId": "{{EVENT_ID}}" }` |
+| Điều kiện | Chạy sau TC-LOCK-01 (cùng user) |
+| Status | `200 OK` |
+| Response | `{ "lockId": "uuid", "seatId": "{{SEAT_ID_1}}", "expiresAt": "..." }` (lockId trùng row cũ) |
+| Verify Redis | `SCARD held:event:{{EVENT_ID}}:user:<userId>` không tăng — vẫn = 1 |
+| Verify DB | `SELECT count(*) FROM seat_locks WHERE seat_id='{{SEAT_ID_1}}' AND status='ACTIVE'` = 1 (không tạo row mới) |
+
+---
+
+### TC-LOCK-04 — Vượt giới hạn MAX_SEATS_PER_USER (TICKET_LIMIT_REACHED)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/booking/seats/{{SEAT_ID_5}}/lock` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Body (JSON) | `{ "eventId": "{{EVENT_ID}}" }` |
+| Điều kiện | TOKEN đã khóa thành công SEAT_ID_1..4 (đủ MAX=4) |
+| Bước trước | Lock SEAT_ID_2, SEAT_ID_3, SEAT_ID_4 lần lượt → 200 OK |
+| Status | `422 Unprocessable Entity` |
+| Response | `{ "statusCode": 422, "message": { "code": "TICKET_LIMIT_REACHED", "message": "User ... reached the seat hold limit of 4" }, "path": "...", "timestamp": "..." }` |
+| Verify Redis | `SCARD held:event:{{EVENT_ID}}:user:<userId>` = 4 (không tăng thành 5) |
+| Verify Redis | `EXISTS lock:event:{{EVENT_ID}}:seat:{{SEAT_ID_5}}` = 0 (không tạo lock) |
+
+---
+
+### TC-LOCK-05 — Khóa ghế không có token
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/booking/seats/{{SEAT_ID_1}}/lock` |
+| Body (JSON) | `{ "eventId": "{{EVENT_ID}}" }` |
+| Status | `401 Unauthorized` |
+| Response | `{ "statusCode": 401, "message": "Token không hợp lệ hoặc đã hết hạn", "path": "...", "timestamp": "..." }` |
+
+---
+
+### TC-LOCK-06 — seatId không phải UUID hợp lệ
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/booking/seats/not-a-uuid/lock` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Body (JSON) | `{ "eventId": "{{EVENT_ID}}" }` |
+| Status | `400 Bad Request` |
+| Response | `{ "statusCode": 400, "message": "Validation failed (uuid is expected)", "path": "...", "timestamp": "..." }` |
+
+---
+
+### TC-LOCK-07 — Thiếu eventId trong body
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/booking/seats/{{SEAT_ID_1}}/lock` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Body (JSON) | `{}` |
+| Status | `400 Bad Request` |
+| Response | `{ "statusCode": 400, "message": ["eventId must be a UUID"], "path": "...", "timestamp": "..." }` |
+
+---
+
+### TC-LOCK-08 — eventId không đúng định dạng UUID
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/booking/seats/{{SEAT_ID_1}}/lock` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Body (JSON) | `{ "eventId": "abc" }` |
+| Status | `400 Bad Request` |
+| Response | `{ "statusCode": 400, "message": ["eventId must be a UUID"], ... }` |
+
+---
+
+### TC-LOCK-09 — Giải phóng ghế của mình thành công
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `DELETE` |
+| URL | `{{BASE_URL}}/booking/seats/{{SEAT_ID_1}}/lock` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Body (JSON) | `{ "eventId": "{{EVENT_ID}}" }` |
+| Điều kiện | Đã chạy TC-LOCK-01 (user đang giữ SEAT_ID_1) |
+| Status | `204 No Content` |
+| Response | _(rỗng)_ |
+| Verify Redis | `EXISTS lock:event:{{EVENT_ID}}:seat:{{SEAT_ID_1}}` = 0 |
+| Verify Redis | `SISMEMBER held:event:{{EVENT_ID}}:user:<userId> {{SEAT_ID_1}}` = 0 |
+| Verify Redis | `SISMEMBER held:event:{{EVENT_ID}} {{SEAT_ID_1}}` = 0 |
+| Verify DB | `SELECT status, released_at FROM seat_locks WHERE seat_id='{{SEAT_ID_1}}'` → status=RELEASED, released_at IS NOT NULL |
+
+---
+
+### TC-LOCK-10 — Giải phóng ghế không phải của mình (403)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `DELETE` |
+| URL | `{{BASE_URL}}/booking/seats/{{SEAT_ID_2}}/lock` |
+| Header | `Authorization: Bearer {{TOKEN_2}}` |
+| Body (JSON) | `{ "eventId": "{{EVENT_ID}}" }` |
+| Điều kiện | SEAT_ID_2 đang bị TOKEN giữ (không phải TOKEN_2) |
+| Status | `403 Forbidden` |
+| Response | `{ "statusCode": 403, "message": "You do not own a lock on this seat (or it has expired)", "path": "...", "timestamp": "..." }` |
+| Verify Redis | Lock key trên SEAT_ID_2 vẫn còn, value vẫn = user 1 |
+
+---
+
+### TC-LOCK-11 — Giải phóng ghế đã hết hạn / chưa từng khóa (403)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `DELETE` |
+| URL | `{{BASE_URL}}/booking/seats/{{SEAT_ID_5}}/lock` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Body (JSON) | `{ "eventId": "{{EVENT_ID}}" }` |
+| Điều kiện | SEAT_ID_5 chưa từng được lock bởi user này |
+| Status | `403 Forbidden` |
+| Response | `{ "statusCode": 403, "message": "You do not own a lock on this seat (or it has expired)", ... }` |
+
+---
+
+### TC-LOCK-12 — Sau khi release, ghế có thể được khóa lại
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/booking/seats/{{SEAT_ID_1}}/lock` |
+| Header | `Authorization: Bearer {{TOKEN_2}}` |
+| Body (JSON) | `{ "eventId": "{{EVENT_ID}}" }` |
+| Điều kiện | Đã chạy TC-LOCK-09 (SEAT_ID_1 đã được giải phóng) |
+| Status | `200 OK` |
+| Response | `{ "lockId": "uuid-mới", "seatId": "{{SEAT_ID_1}}", "expiresAt": "..." }` |
+| Verify DB | `SELECT count(*) FROM seat_locks WHERE seat_id='{{SEAT_ID_1}}'` → 2 rows (1 RELEASED, 1 ACTIVE) |
+
+---
+
+### TC-LOCK-13 — Double-booking 100 client cùng giành 1 ghế (concurrency)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` (100 request đồng thời) |
+| URL | `{{BASE_URL}}/booking/seats/{{SEAT_ID_3}}/lock` |
+| Header | 100 token user khác nhau |
+| Body (JSON) | `{ "eventId": "{{EVENT_ID}}" }` |
+| Cách chạy | Postman Runner ×100 / hoặc script Node `Promise.all` / hoặc `k6` |
+| Kết quả mong đợi | Đúng **1 request 200 OK**, **99 request 409 SEAT_TAKEN** |
+| Verify Redis | `GET lock:event:{{EVENT_ID}}:seat:{{SEAT_ID_3}}` = 1 userId duy nhất |
+| Verify DB | `SELECT count(*) FROM seat_locks WHERE seat_id='{{SEAT_ID_3}}' AND status='ACTIVE'` = 1 |
+| Ghi chú | Đã được cover bởi `src/booking/seat-lock/seat-lock.integration.spec.ts` test 1. Chạy `npm test -- seat-lock.integration` để verify tự động. |
+
+---
+
+### Kiểm tra Redis key UC09
+
+```powershell
+docker exec -it concert_redis redis-cli -a redis
+
+# Lock key — userId là value
+KEYS lock:event:*:seat:*
+GET lock:event:<eventId>:seat:<seatId>
+TTL lock:event:<eventId>:seat:<seatId>   # còn ~900s
+
+# Per-user set — số ghế user đang giữ
+KEYS held:event:*:user:*
+SMEMBERS held:event:<eventId>:user:<userId>
+SCARD held:event:<eventId>:user:<userId>   # <= MAX_SEATS_PER_USER
+
+# Per-event set — tất cả ghế đang bị giữ trong event (cho UC08)
+SMEMBERS held:event:<eventId>
+```
+
+---
+
 ## Luồng test hoàn chỉnh (Happy Path)
 
 Thực hiện theo đúng thứ tự:
@@ -775,9 +1000,18 @@ Thực hiện theo đúng thứ tự:
 22. GET  /organizer/events/:eventId/stats          → xem thống kê (orders=0, seats=80 AVAILABLE)
 23. GET  /organizer/profile                        → xem profile organizer
 
-── Bước 5: Security test ──
-24. POST /auth/logout                              → logout user (TOKEN cũ)
-25. GET  /users/me (TOKEN cũ)                      → expect 401 (blacklisted)
+── Bước 5: Khóa ghế (UC09) ──
+24. [Prisma Studio] Copy 5 seatId vào SEAT_ID_1..5
+25. POST /booking/seats/{{SEAT_ID_1}}/lock         → 200, ghi nhận lockId, expiresAt
+26. POST /booking/seats/{{SEAT_ID_1}}/lock (TOKEN_2)→ 409 SEAT_TAKEN
+27. POST /booking/seats/{{SEAT_ID_2..4}}/lock      → 200, đủ MAX=4 ghế
+28. POST /booking/seats/{{SEAT_ID_5}}/lock         → 422 TICKET_LIMIT_REACHED
+29. DELETE /booking/seats/{{SEAT_ID_1}}/lock       → 204, lock được giải phóng
+30. POST /booking/seats/{{SEAT_ID_1}}/lock (TOKEN_2)→ 200, ghế lock lại được
+
+── Bước 6: Security test ──
+31. POST /auth/logout                              → logout user (TOKEN cũ)
+32. GET  /users/me (TOKEN cũ)                      → expect 401 (blacklisted)
 ```
 
 ---
@@ -822,3 +1056,7 @@ npx prisma studio
 | Event public | Chỉ event có `status=ACTIVE` mới xuất hiện ở `GET /events` — Admin cần duyệt (chưa implement) |
 | Ticket price | Trả về dạng `string` decimal từ Prisma, ví dụ `"500000"` không phải `500000` |
 | UUID test | Dùng `00000000-0000-0000-0000-000000000000` để test 404, không dùng string ngẫu nhiên |
+| Seat Lock env | `MAX_SEATS_PER_USER=4` trong `.env` — đổi giá trị này thì TC-LOCK-04 phải đổi theo |
+| Seat Lock TTL | 900 giây (15 phút) cứng trong code, không qua env |
+| Seat Lock atomicity | Acquire + Release đều là 1 Lua EVAL — không thể tách ra để test riêng bằng API |
+| Swagger | `http://localhost:3000/api/docs` — đã bật từ task seat-lock |
