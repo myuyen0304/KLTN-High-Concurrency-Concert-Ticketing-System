@@ -4,6 +4,7 @@ import { APP_FILTER, APP_GUARD } from '@nestjs/core';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { AuthModule } from './auth/auth.module';
+import { SeatLockModule } from './booking/seat-lock/seat-lock.module';
 import { EventsModule } from './events/events.module';
 import { OrganizerModule } from './organizer/organizer.module';
 import { SeatsModule } from './seats/seats.module';
@@ -25,6 +26,7 @@ import { RedisModule } from './redis/redis.module';
     TicketTypesModule,
     SeatsModule,
     OrganizerModule,
+    SeatLockModule,
   ],
   controllers: [AppController],
   providers: [
