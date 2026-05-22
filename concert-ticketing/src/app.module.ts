@@ -12,6 +12,7 @@ import { TicketTypesModule } from './ticket-types/ticket-types.module';
 import { UsersModule } from './users/users.module';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
+import { MessagingModule } from './common/messaging/messaging.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { RedisModule } from './redis/redis.module';
 
@@ -20,6 +21,7 @@ import { RedisModule } from './redis/redis.module';
     ConfigModule.forRoot({ isGlobal: true }),
     PrismaModule,
     RedisModule,
+    MessagingModule,
     AuthModule,
     UsersModule,
     EventsModule,
