@@ -962,6 +962,167 @@ SMEMBERS held:event:<eventId>
 
 ---
 
+## Module: Virtual Queue (UC07)
+
+> **Bối cảnh:** Phòng chờ ảo FIFO + điều tiết admission (BC3 — lõi học thuật). Hàng chờ là Sorted Set Redis (score = seq từ `INCR`, đảm bảo FIFO tuyệt đối). Một **scheduler chạy mỗi ~2 giây** (không nằm trong request join) sẽ nạp người từ đầu hàng vào "vùng được phép chọn ghế" khi còn slot. Cấp **token** có TTL = `WaitingRoom.bookingWindow`; số người active ≤ `WaitingRoom.maxConcurrent`. Yêu cầu `Authorization: Bearer {{TOKEN}}` cho cả 2 endpoint (BR10).
+>
+> **Chuẩn bị phòng chờ (chưa có API tạo — seed thủ công qua Prisma Studio `npx prisma studio` → bảng `waiting_rooms`):**
+> - Thêm 1 row: `eventId = {{EVENT_ID}}`, `isOpen = true`, `maxConcurrent = 2`, `bookingWindow = 900`.
+>   (Để `maxConcurrent` nhỏ cho dễ quan sát: 2 người đầu được admit, người thứ 3 trở đi phải chờ.)
+> - Cần ≥ 3 user đã ACTIVE để test CAP/chờ-lượt: `TOKEN`, `TOKEN_2`, và `TOKEN_3` (đăng ký + verify-otp + login thêm user thứ 3).
+> - `npm run start:dev` phải đang chạy để scheduler admission hoạt động.
+> - Token TTL = `bookingWindow` (900s) ⇒ test xong 1 lượt, slot không tự nhả sớm; muốn reset nhanh thì xoá key Redis (xem cuối mục).
+
+### TC-QUEUE-01 — Vào hàng chờ thành công
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/queue/{{EVENT_ID}}/join` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Body | _(không cần body)_ |
+| Status | `200 OK` |
+| Response | `{ "position": 1, "estimatedWaitSec": 900 }` |
+| Ghi chú | `position` = thứ hạng FIFO (bắt đầu từ 1). `estimatedWaitSec = ceil(position / maxConcurrent) * bookingWindow`. |
+| Verify Redis | `ZSCORE queue:event:{{EVENT_ID}} <userId>` → có score; `ZCARD queue:event:{{EVENT_ID}}` = số người đang chờ |
+
+---
+
+### TC-QUEUE-02 — Vào hàng chờ lần 2 (idempotent)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/queue/{{EVENT_ID}}/join` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Điều kiện | Cùng user, chạy ngay sau TC-QUEUE-01 |
+| Status | `200 OK` |
+| Response | `{ "position": 1, "estimatedWaitSec": 900 }` (trùng position lần đầu) |
+| Verify Redis | `ZCARD queue:event:{{EVENT_ID}}` KHÔNG tăng — join lại không thêm slot, không đẩy về cuối hàng |
+
+---
+
+### TC-QUEUE-03 — Vào hàng chờ khi phòng chờ chưa mở / không tồn tại (QUEUE_CLOSED)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/queue/{{EVENT_ID_NO_ROOM}}/join` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Điều kiện | Event không có `waiting_rooms` row, hoặc row có `isOpen = false` |
+| Status | `422 Unprocessable Entity` |
+| Response | `{ "statusCode": 422, "message": { "code": "QUEUE_CLOSED", "message": "Waiting room for event ... is not open" }, "path": "...", "timestamp": "..." }` |
+
+---
+
+### TC-QUEUE-04 — Vào hàng chờ không có token
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/queue/{{EVENT_ID}}/join` |
+| Status | `401 Unauthorized` |
+| Response | `{ "statusCode": 401, "message": "Token không hợp lệ hoặc đã hết hạn", "path": "...", "timestamp": "..." }` |
+| Ghi chú | BR10 — bắt buộc đăng nhập trước khi vào queue (đã cover tự động ở `queue.auth.e2e.spec.ts`) |
+
+---
+
+### TC-QUEUE-05 — eventId không phải UUID hợp lệ
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/queue/not-a-uuid/join` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Status | `400 Bad Request` |
+| Response | `{ "statusCode": 400, "message": "Validation failed (uuid is expected)", "path": "...", "timestamp": "..." }` |
+
+---
+
+### TC-QUEUE-06 — Poll trạng thái: đang chờ, chưa tới lượt
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `GET` |
+| URL | `{{BASE_URL}}/queue/{{EVENT_ID}}/status` |
+| Header | `Authorization: Bearer {{TOKEN_3}}` |
+| Điều kiện | 2 slot (maxConcurrent=2) đã đầy bởi TOKEN, TOKEN_2; TOKEN_3 đã join và còn xếp sau |
+| Status | `200 OK` |
+| Response | `{ "admitted": false, "position": 1 }` |
+| Ghi chú | `position` là thứ hạng hiện tại trong hàng (giảm dần khi người trước được admit & rời hàng) |
+
+---
+
+### TC-QUEUE-07 — Poll trạng thái: đã tới lượt (được admit)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `GET` |
+| URL | `{{BASE_URL}}/queue/{{EVENT_ID}}/status` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Điều kiện | Chờ ≥ 2 giây sau khi join để scheduler admission chạy (TOKEN nằm trong `maxConcurrent` đầu) |
+| Status | `200 OK` |
+| Response | `{ "admitted": true, "expiresAt": "2026-05-22T..." }` |
+| Ghi chú | `expiresAt` = now + `bookingWindow` (≈ TTL còn lại của token). Sau khi admitted → user được phép sang chọn/khoá ghế (UC08/UC09). |
+| Verify Redis | `EXISTS token:event:{{EVENT_ID}}:user:<userId>` = 1, `TTL` ~ 900; `SISMEMBER active:event:{{EVENT_ID}} <userId>` = 1 |
+
+---
+
+### TC-QUEUE-08 — Poll trạng thái khi chưa từng join
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `GET` |
+| URL | `{{BASE_URL}}/queue/{{EVENT_ID}}/status` |
+| Header | `Authorization: Bearer {{TOKEN_NEW}}` _(user chưa join queue này)_ |
+| Status | `200 OK` |
+| Response | `{ "admitted": false, "position": 0 }` |
+| Ghi chú | `position = 0` nghĩa là không có trong hàng chờ |
+
+---
+
+### TC-QUEUE-09 — CAP: nhiều user join, không vượt maxConcurrent (concurrency)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` (nhiều request đồng thời) |
+| URL | `{{BASE_URL}}/queue/{{EVENT_ID}}/join` |
+| Header | Nhiều token user khác nhau |
+| Cách chạy | Postman Runner / script Node `Promise.all` / `k6` |
+| Kết quả mong đợi | Tất cả join 200 OK; sau 1 chu kỳ admission, số token sống ≤ `maxConcurrent` ở **mọi thời điểm** |
+| Verify Redis | `SCARD active:event:{{EVENT_ID}}` ≤ `maxConcurrent` |
+| Ghi chú | Đã cover tự động: `src/queue/queue.integration.spec.ts` (FIFO 50 user, CAP 100→10, refill, idempotent). Chạy `npm test -- queue` để verify. |
+
+---
+
+### Kiểm tra Redis key UC07
+
+```powershell
+docker exec -it concert_redis redis-cli -a redis
+
+# Hàng chờ FIFO (score = seq, nhỏ hơn = vào trước)
+ZRANGE queue:event:<eventId> 0 -1 WITHSCORES
+ZCARD  queue:event:<eventId>
+ZRANK  queue:event:<eventId> <userId>     # thứ hạng 0-based
+
+# Bộ đếm seq sinh thứ tự FIFO
+GET queue:event:<eventId>:seq
+
+# Tập người đang active (đang giữ token chọn ghế) — luôn <= maxConcurrent
+SMEMBERS active:event:<eventId>
+SCARD    active:event:<eventId>
+
+# Token "đến lượt" của 1 user (tự hết hạn theo bookingWindow)
+EXISTS token:event:<eventId>:user:<userId>
+TTL    token:event:<eventId>:user:<userId>
+
+# Reset nhanh khi test lại (xoá toàn bộ state queue của 1 event)
+DEL queue:event:<eventId> queue:event:<eventId>:seq active:event:<eventId>
+KEYS token:event:<eventId>:user:*    # rồi DEL từng key nếu cần
+```
+
+---
+
 ## Luồng test hoàn chỉnh (Happy Path)
 
 Thực hiện theo đúng thứ tự:
@@ -1000,7 +1161,14 @@ Thực hiện theo đúng thứ tự:
 22. GET  /organizer/events/:eventId/stats          → xem thống kê (orders=0, seats=80 AVAILABLE)
 23. GET  /organizer/profile                        → xem profile organizer
 
-── Bước 5: Khóa ghế (UC09) ──
+── Bước 5a: Phòng chờ ảo (UC07) — trước khi chọn/khoá ghế ──
+    [Prisma Studio] Thêm waiting_rooms: eventId=EVENT_ID, isOpen=true, maxConcurrent=2, bookingWindow=900
+Q1. POST /queue/{{EVENT_ID}}/join (TOKEN)          → 200 { position, estimatedWaitSec }
+Q2. GET  /queue/{{EVENT_ID}}/status (TOKEN)        → chờ ~2s (scheduler) → { admitted: true, expiresAt }
+Q3. POST /queue/{{EVENT_ID}}/join (TOKEN_2, TOKEN_3) → fill/quá CAP để quan sát người chờ
+Q4. GET  /queue/{{EVENT_ID}}/status (TOKEN_3)      → { admitted: false, position } khi CAP đầy
+
+── Bước 5b: Khóa ghế (UC09) ──
 24. [Prisma Studio] Copy 5 seatId vào SEAT_ID_1..5
 25. POST /booking/seats/{{SEAT_ID_1}}/lock         → 200, ghi nhận lockId, expiresAt
 26. POST /booking/seats/{{SEAT_ID_1}}/lock (TOKEN_2)→ 409 SEAT_TAKEN
@@ -1059,4 +1227,8 @@ npx prisma studio
 | Seat Lock env | `MAX_SEATS_PER_USER=4` trong `.env` — đổi giá trị này thì TC-LOCK-04 phải đổi theo |
 | Seat Lock TTL | 900 giây (15 phút) cứng trong code, không qua env |
 | Seat Lock atomicity | Acquire + Release đều là 1 Lua EVAL — không thể tách ra để test riêng bằng API |
-| Swagger | `http://localhost:3000/api/docs` — đã bật từ task seat-lock |
+| Queue waiting room | Chưa có API tạo `waiting_rooms` — seed thủ công qua Prisma Studio (`isOpen=true`, `maxConcurrent`, `bookingWindow`) trước khi test UC07 |
+| Queue admission | Là scheduler chạy mỗi ~2s (KHÔNG trong request join) — phải để `npm run start:dev` chạy; poll `GET /status` để thấy `admitted` chuyển true |
+| Queue CAP & TTL | CAP = `WaitingRoom.maxConcurrent`, token TTL = `WaitingRoom.bookingWindow` (đọc từ DB, không hardcode) |
+| Queue FIFO | Score hàng chờ = `seq` (INCR), KHÔNG dùng timestamp — đảm bảo FIFO tuyệt đối kể cả nhiều pod |
+| Swagger | `http://localhost:3000/api/docs` — có tag `queue` + `seat-lock` |
