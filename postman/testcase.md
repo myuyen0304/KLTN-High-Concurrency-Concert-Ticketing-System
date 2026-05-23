@@ -27,6 +27,9 @@
    - `TICKET_TYPE_ID` = _(để trống, điền sau khi tạo ticket type)_
    - `ORDER_ID` = _(để trống, điền sau khi tạo order)_
    - `IDEM_KEY` = _(để trống — sinh UUID mới mỗi đơn)_
+   - `PAYMENT_SECRET` = `mock-callback-secret` _(= `PAYMENT_CALLBACK_SECRET` trong `.env`)_
+   - `GATEWAY_TX_ID` = _(để trống — sinh trong pre-request script callback)_
+   - `CALLBACK_SIG` = _(để trống — HMAC sinh trong pre-request script callback)_
 
 ---
 
@@ -45,8 +48,8 @@
 | **Seat Lock (UC09)** | BC3 | ✅ done | TC-LOCK-01..13 | `seat-lock.integration.spec.ts` |
 | **Virtual Queue (UC07)** | BC3 | ✅ done | TC-QUEUE-01..09 | `queue.integration.spec.ts` · `queue.auth.e2e.spec.ts` |
 | **Order (UC10)** | BC4 | ✅ done | **TC-ORDER-01..12** | `order.integration.spec.ts` |
+| **Payment (UC11)** | BC5 | ✅ done | **TC-PAY-01..13** | `payment.integration.spec.ts` |
 | Seat Selection (UC08) | BC3 | 🔜 chưa làm | — | — |
-| Payment (UC11) | BC5 | 🔜 chưa làm | — | — |
 | Admin duyệt event/organizer (UC20–24) | BC1/BC2 | 🔜 chưa làm | — | — |
 | Notifications | BC6 | 🔜 chưa làm | — | — |
 
@@ -1341,6 +1344,220 @@ TTL  lock:event:<eventId>:seat:<seatId>     # ~ BOOKING_WINDOW_SECONDS sau khi t
 
 ---
 
+## Module: Payment (UC11)
+
+> **Bối cảnh:** Thanh toán + callback idempotent + phát hành vé async (BC5 — lõi). **Compare-and-set là điểm ghi DUY NHẤT** quyết định đơn: trong **1 `$transaction`** gồm `UPDATE orders SET status=PAID WHERE id=? AND status=PENDING AND expiresAt>now()` + INSERT `PaymentTransaction`(SUCCESS, `idempotencyKey=orderId`, `amount`=tổng đơn server-side) + `Seat→SOLD` ⇒ đóng khe crash "PAID mà chưa có payment/ghế". Side-effect SAU commit (nhả lock Redis + publish phát vé) là **idempotent**; callback trùng (đã PAID) **re-drive lại chính 2 side-effect đó** (self-heal). Phát vé **async** qua RabbitMQ (publish **tức thì** tới `work.x`/`ticket.issue`), `TicketIssuanceConsumer` idempotent theo `@@unique([orderId,seatId])`. Mock gateway ký **HMAC-SHA256** `orderId|gatewayTxId|outcome` bằng `PAYMENT_CALLBACK_SECRET`.
+>
+> **Chuẩn bị:**
+> - Đã chạy UC10: có `{{ORDER_ID}}` ở trạng thái **PENDING** (ghế còn hold). Nếu thiếu → tạo lại qua TC-ORDER-01.
+> - `concert_rabbitmq` đang chạy + `npm run start:dev` (để consumer phát vé hoạt động).
+> - `.env`: `PAYMENT_CALLBACK_SECRET=mock-callback-secret`, `MOCK_PAYMENT_GATEWAY_URL=http://localhost:3000/mock-gateway`.
+> - Callback do cổng gọi (**không cần JWT** — endpoint `@Public`), nhưng phải **đúng chữ ký**. Dùng **Pre-request Script** dưới đây cho mọi request callback để tự sinh `GATEWAY_TX_ID` + `CALLBACK_SIG`:
+>
+> ```js
+> // Pre-request Script cho POST /payment/callback
+> const orderId = pm.collectionVariables.get('ORDER_ID');
+> const outcome = 'SUCCESS';                       // đổi 'FAILED' cho TC-PAY-10
+> const gatewayTxId = 'gw-' + Date.now();
+> const secret = pm.collectionVariables.get('PAYMENT_SECRET');
+> const sig = CryptoJS.HmacSHA256(`${orderId}|${gatewayTxId}|${outcome}`, secret)
+>               .toString(CryptoJS.enc.Hex);
+> pm.collectionVariables.set('GATEWAY_TX_ID', gatewayTxId);
+> pm.collectionVariables.set('CALLBACK_SIG', sig);
+> ```
+
+### TC-PAY-01 — Initiate payment thành công (201)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/payment/{{ORDER_ID}}/initiate` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Điều kiện | `{{ORDER_ID}}` là đơn PENDING của chính `TOKEN` |
+| Status | `201 Created` |
+| Response | `{ "redirectUrl": "http://localhost:3000/mock-gateway?orderId=...&amount=500000" }` |
+| Ghi chú | MVP mock: `redirectUrl` chỉ mô phỏng — không redirect thật. Cổng sẽ gọi lại `POST /payment/callback`. |
+
+---
+
+### TC-PAY-02 — Initiate đơn không tồn tại / không phải của mình (404)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/payment/00000000-0000-0000-0000-000000000000/initiate` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Status | `404 Not Found` |
+| Response | `{ "statusCode": 404, "message": { "code": "ORDER_NOT_FOUND", "message": "Order ... not found" }, "path": "...", "timestamp": "..." }` |
+| Ghi chú | Đơn của user khác cũng trả 404 (không lộ thông tin chéo user). |
+
+---
+
+### TC-PAY-03 — Initiate đơn không còn PENDING (409 ORDER_NOT_PAYABLE)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/payment/{{ORDER_ID}}/initiate` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Điều kiện | `{{ORDER_ID}}` đã `PAID`/`EXPIRED`/`CANCELLED` (vd sau TC-PAY-05, hoặc set thủ công qua Prisma Studio) |
+| Status | `409 Conflict` |
+| Response | `{ "statusCode": 409, "message": { "code": "ORDER_NOT_PAYABLE", "message": "Order ... is not payable (status PAID)" }, "path": "...", "timestamp": "..." }` |
+
+---
+
+### TC-PAY-04 — Initiate không có token (401)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/payment/{{ORDER_ID}}/initiate` |
+| Status | `401 Unauthorized` |
+| Response | `{ "statusCode": 401, "message": "Token không hợp lệ hoặc đã hết hạn", "path": "...", "timestamp": "..." }` |
+
+---
+
+### TC-PAY-05 — Callback SUCCESS hợp lệ → PAID + ghế SOLD + phát vé (happy path)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/payment/callback` |
+| Pre-request | Script HMAC ở trên với `outcome='SUCCESS'` |
+| Body (JSON) | `{ "orderId": "{{ORDER_ID}}", "gatewayTxId": "{{GATEWAY_TX_ID}}", "outcome": "SUCCESS", "signature": "{{CALLBACK_SIG}}" }` |
+| Điều kiện | `{{ORDER_ID}}` đang PENDING + còn hạn |
+| Status | `200 OK` |
+| Response | `{ "status": "ok" }` |
+| Verify DB | `orders.status` = `PAID`; `payment_transactions` 1 row `status=SUCCESS`, `amount`=tổng đơn, `gateway=MOCK`; `seats.status` của ghế trong đơn = `SOLD` |
+| Verify Redis | `EXISTS lock:event:{{EVENT_ID}}:seat:<seatId>` = 0 (lock đã nhả) |
+| Verify vé (async) | Sau ~1s consumer phát vé: `SELECT count(*) FROM tickets WHERE order_id='{{ORDER_ID}}'` = số ghế, `status=ISSUED`, `qr_code` duy nhất |
+
+---
+
+### TC-PAY-06 — Callback chữ ký giả (EX2 → 400, không lộ chi tiết)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/payment/callback` |
+| Body (JSON) | `{ "orderId": "{{ORDER_ID}}", "gatewayTxId": "gw-fake", "outcome": "SUCCESS", "signature": "forged-signature" }` |
+| Điều kiện | KHÔNG dùng pre-request script (cố tình sai chữ ký); đơn đang PENDING |
+| Status | `400 Bad Request` |
+| Response | `{ "statusCode": 400, "message": { "code": "PAYMENT_INVALID_SIGNATURE", "message": "Invalid callback" }, "path": "...", "timestamp": "..." }` |
+| Verify DB | `orders.status` vẫn `PENDING`; KHÔNG có `payment_transactions` row |
+| Ghi chú | Server log cảnh báo bảo mật; response **không** tiết lộ lý do thật (EX2). |
+
+---
+
+### TC-PAY-07 — Callback trùng (AF2 duplicate) → PAID 1 lần, đúng 1 transaction
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` (gửi 2 lần) |
+| URL | `{{BASE_URL}}/payment/callback` |
+| Body (JSON) | callback SUCCESS hợp lệ (như TC-PAY-05), gửi lặp lại lần 2 |
+| Status | `200 OK` (cả 2 lần) |
+| Verify DB | `orders.status`=`PAID`; `SELECT count(*) FROM payment_transactions WHERE order_id='{{ORDER_ID}}'` = **1**; `SELECT count(*) FROM tickets WHERE order_id='{{ORDER_ID}}'` = số ghế (KHÔNG nhân đôi) |
+| Ghi chú | Lần 2 đụng order đã PAID → re-drive side-effect idempotent (nhả lock + publish lại), consumer dedupe theo `@@unique([orderId,seatId])`. |
+
+---
+
+### TC-PAY-08 — Callback SUCCESS khi đơn đã EXPIRED (EX1 → REFUNDED, không phát vé)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/payment/callback` |
+| Body (JSON) | callback SUCCESS hợp lệ cho `{{ORDER_ID}}` |
+| Điều kiện | `{{ORDER_ID}}` đã `EXPIRED` (chờ timeout, hoặc set qua Prisma Studio) trước khi gọi |
+| Status | `200 OK` |
+| Response | `{ "status": "ok" }` |
+| Verify DB | `orders.status` vẫn `EXPIRED`; `payment_transactions` 1 row `status=REFUNDED` (cho Admin xử lý — BR11); KHÔNG có `tickets` |
+| Ghi chú | Tiền đã trừ nhưng đơn hết hạn → ghi REFUNDED, KHÔNG phát vé. |
+
+---
+
+### TC-PAY-09 — Callback SUCCESS khi PENDING nhưng quá hạn (guard `expiresAt`)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/payment/callback` |
+| Body (JSON) | callback SUCCESS hợp lệ |
+| Điều kiện | Đơn còn `PENDING` nhưng `expiresAt < now()` (DLE chưa kịp bắn — set `expiresAt` về quá khứ qua Prisma Studio) |
+| Status | `200 OK` |
+| Verify DB | `orders.status` vẫn `PENDING` (CAS bị guard `expiresAt>now()` chặn → không PAID); `payment_transactions` 1 row `status=REFUNDED`; KHÔNG có `tickets` |
+| Ghi chú | Chống thanh-toán-sau-hạn: đơn sẽ được DLE chuyển `EXPIRED` ngay sau đó. |
+
+---
+
+### TC-PAY-10 — Callback outcome FAILED → không đổi trạng thái, ACK
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/payment/callback` |
+| Pre-request | Script HMAC với `outcome='FAILED'` |
+| Body (JSON) | `{ "orderId": "{{ORDER_ID}}", "gatewayTxId": "{{GATEWAY_TX_ID}}", "outcome": "FAILED", "signature": "{{CALLBACK_SIG}}" }` |
+| Điều kiện | Đơn đang PENDING |
+| Status | `200 OK` |
+| Response | `{ "status": "ok" }` |
+| Verify DB | `orders.status` vẫn `PENDING`; KHÔNG có `payment_transactions`; KHÔNG có `tickets` |
+| Ghi chú | Thanh toán thất bại → đơn giữ PENDING, sẽ tự `EXPIRED` qua DLE; user có thể initiate lại. |
+
+---
+
+### TC-PAY-11 — Validation callback thiếu field (400)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/payment/callback` |
+| Body (JSON) | `{ "orderId": "{{ORDER_ID}}" }` |
+| Status | `400 Bad Request` |
+| Response | `{ "statusCode": 400, "message": ["outcome must be one of the following values: SUCCESS, FAILED", "signature should not be empty"], "path": "...", "timestamp": "..." }` |
+
+---
+
+### TC-PAY-12 — Poll trạng thái đơn (confirmation page)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `GET` |
+| URL | `{{BASE_URL}}/orders/{{ORDER_ID}}/status` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Status | `200 OK` |
+| Response (chưa thanh toán) | `{ "status": "PENDING", "totalAmount": "500000", "ticketsIssued": false }` |
+| Response (đã PAID + phát vé) | `{ "status": "PAID", "totalAmount": "500000", "ticketsIssued": true }` |
+| Ghi chú | Confirmation page poll endpoint này: `PAID` + `ticketsIssued=true` → hiện vé/QR; ngược lại "Đang xác nhận…". Đơn không tồn tại / không phải của mình → `404`. |
+
+---
+
+### TC-PAY-13 — Phát vé idempotent qua consumer (redelivery không phát trùng)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Cơ chế | `TicketIssuanceConsumer` nhận `ticket.issue` → `IssueTicketsUseCase` `createMany skipDuplicates` dựa trên `@@unique([orderId,seatId])` |
+| Kết quả mong đợi | Message bị redelivery (nack/reconnect) → chạy lại KHÔNG phát trùng: đúng 1 vé / ghế |
+| Verify DB | `SELECT count(*) FROM tickets WHERE order_id='{{ORDER_ID}}'` = số ghế của đơn (ổn định dù callback/consumer chạy nhiều lần) |
+| Tự động | Đã cover: `payment.integration.spec.ts` — _"duplicate callback (AF2) ... 1 transaction"_ + _"happy path ... consumer issues tickets"_. Chạy `npm test -- payment`. |
+
+---
+
+### Kiểm tra Redis/DB UC11
+
+```powershell
+# DB (Prisma Studio): orders.status=PAID, payment_transactions (status/amount/gatewayTxId/idempotencyKey=orderId),
+#                     seats.status=SOLD, tickets (qrCode/status=ISSUED, @@unique[orderId,seatId])
+
+docker exec -it concert_redis redis-cli -a redis
+EXISTS lock:event:<eventId>:seat:<seatId>     # = 0 sau khi PAID (lock đã nhả)
+
+# RabbitMQ UI http://localhost:15672 (guest/guest) → Queues → ticket.issue.q (phát vé), order.timeout.q (DLE)
+```
+
+---
+
 ## Luồng test hoàn chỉnh (Happy Path)
 
 Thực hiện theo đúng thứ tự:
@@ -1401,9 +1618,16 @@ Q4. GET  /queue/{{EVENT_ID}}/status (TOKEN_3)      → { admitted: false, positi
 32. POST /orders (TOKEN, cùng body + cùng key)                           → 200 replay (trùng ORDER_ID)
 33. POST /orders (TOKEN, seatIds=[SEAT_ID_5 chưa giữ], key mới)          → 422 SEAT_HOLD_EXPIRED
 
+── Bước 5d: Thanh toán + phát vé (UC11) ──
+34. POST /payment/{{ORDER_ID}}/initiate (TOKEN)    → 201 { redirectUrl }
+35. POST /payment/callback (Public, pre-request HMAC, outcome=SUCCESS)
+    Body: { orderId: ORDER_ID, gatewayTxId: {{GATEWAY_TX_ID}}, outcome: "SUCCESS", signature: {{CALLBACK_SIG}} }
+                                                   → 200 { status: "ok" }; order PAID, ghế SOLD, lock nhả
+36. GET  /orders/{{ORDER_ID}}/status (TOKEN)       → chờ ~1s (consumer phát vé) → { status: "PAID", ticketsIssued: true }
+
 ── Bước 6: Security test ──
-34. POST /auth/logout                              → logout user (TOKEN cũ)
-35. GET  /users/me (TOKEN cũ)                      → expect 401 (blacklisted)
+37. POST /auth/logout                              → logout user (TOKEN cũ)
+38. GET  /users/me (TOKEN cũ)                      → expect 401 (blacklisted)
 ```
 
 ---
@@ -1458,4 +1682,9 @@ npx prisma studio
 | Order idempotency | `idempotencyKey` **scope theo user** (`@@unique([userId, idempotencyKey])`) — cùng key khác user KHÔNG xung đột; cùng user + cùng key → replay đơn PENDING. Lỗi `IDEMPOTENCY_KEY_CONFLICT` đã **gỡ bỏ**. |
 | Order timeout | Tự hủy qua RabbitMQ DLE sau `BOOKING_WINDOW_SECONDS` (mặc định 900s) — cần `concert_rabbitmq` chạy; RabbitMQ UI `http://localhost:15672` |
 | Order price | `totalAmount` là string decimal = tổng `unitPrice` các ghế |
-| Swagger | `http://localhost:3000/api/docs` — có tag `queue` + `seat-lock` + `order` |
+| Payment CAS | Điểm ghi DUY NHẤT quyết định đơn: `UPDATE orders SET PAID WHERE status=PENDING AND expiresAt>now()` trong 1 `$transaction` cùng `PaymentTransaction` + `Seat SOLD` — đóng khe crash |
+| Payment idempotency | Callback trùng (đã PAID) → re-drive side-effect idempotent (self-heal), không tạo transaction thứ 2 (`PaymentTransaction.orderId @unique`, `idempotencyKey=orderId`) |
+| Payment chữ ký | Mock HMAC-SHA256 `orderId\|gatewayTxId\|outcome` bằng `PAYMENT_CALLBACK_SECRET`; callback là `@Public` (cổng không có JWT) — dùng pre-request script CryptoJS để ký |
+| Payment phát vé | Async qua RabbitMQ (`ticket.issue.q` ← `work.x`, publish tức thì); consumer idempotent theo `@@unique([orderId,seatId])` — redelivery không phát trùng |
+| Payment REFUNDED | Callback SUCCESS tới đơn EXPIRED/CANCELLED hoặc PENDING-quá-hạn → ghi `PaymentTransaction` REFUNDED cho Admin (BR11), KHÔNG phát vé |
+| Swagger | `http://localhost:3000/api/docs` — có tag `queue` + `seat-lock` + `order` + `payment` |
