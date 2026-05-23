@@ -63,7 +63,7 @@ export class PaymentController {
   @Public()
   @Post('callback')
   @HttpCode(200)
-  @ApiOperation({ summary: 'UC11 — Gateway callback (verify signature, ACK)' })
+  @ApiOperation({ summary: 'Gateway callback (verify signature, ACK)' })
   @ApiResponse({ status: 200, description: 'ACK' })
   @ApiResponse({
     status: 400,
