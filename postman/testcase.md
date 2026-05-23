@@ -49,7 +49,7 @@
 | **Virtual Queue (UC07)** | BC3 | ✅ done | TC-QUEUE-01..09 | `queue.integration.spec.ts` · `queue.auth.e2e.spec.ts` |
 | **Order (UC10)** | BC4 | ✅ done | **TC-ORDER-01..12** | `order.integration.spec.ts` |
 | **Payment (UC11)** | BC5 | ✅ done | **TC-PAY-01..13** | `payment.integration.spec.ts` |
-| Seat Selection (UC08) | BC3 | 🔜 chưa làm | — | — |
+| **Seat Selection (UC08)** | BC3 | ✅ done | **TC-SEL-01..08** | `seat-selection.integration.spec.ts` |
 | Admin duyệt event/organizer (UC20–24) | BC1/BC2 | 🔜 chưa làm | — | — |
 | Notifications | BC6 | 🔜 chưa làm | — | — |
 
@@ -988,6 +988,123 @@ SCARD held:event:<eventId>:user:<userId>   # <= MAX_SEATS_PER_USER
 # Per-event set — tất cả ghế đang bị giữ trong event (cho UC08)
 SMEMBERS held:event:<eventId>
 ```
+
+---
+
+## Module: Seat Selection (UC08)
+
+> **Bối cảnh:** Đọc sơ đồ ghế tại thời điểm đặt vé (**read path, layered** — không phải logic concurrency). Hợp nhất trạng thái từ 2 nguồn (polyglot persistence): `Seat.status=SOLD` (Postgres) + ghế đang giữ (held-set Redis do UC09 ghi). Đọc held bằng **1 Lua `SMEMBERS held:event:{e}` + lọc `EXISTS lock:event:{e}:seat:{s}`** (1 round trip, KHÔNG SCAN/KEYS) ⇒ ghế bỏ-ngang (lock đã hết TTL nhưng member chưa được SREM — *held-set drift*) hiện đúng **AVAILABLE**, không HELD oan. READ-ONLY (UC08 không tự dọn set). Thao tác **giữ ghế tái dùng endpoint UC09** `POST /booking/seats/:seatId/lock` (không có endpoint lock riêng). Yêu cầu `Authorization: Bearer {{TOKEN}}`.
+>
+> **Chuẩn bị:**
+> - Đã chạy TC-SEAT-02 (event có 50 ghế A1..E10) và có sẵn `SEAT_ID_1`, `SEAT_ID_5` như mục UC09.
+> - `npm run start:dev` đang chạy; Redis + Postgres (docker compose) up.
+
+### TC-SEL-01 — Lấy sơ đồ ghế (tất cả AVAILABLE)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `GET` |
+| URL | `{{BASE_URL}}/booking/{{EVENT_ID}}/seats` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Điều kiện | Event đã có SEAT_MAP, chưa ghế nào bị giữ/bán |
+| Status | `200 OK` |
+| Response | `[{ "seatId": "uuid", "row": "A", "number": "1", "label": "A1", "status": "AVAILABLE" }, ...]` |
+| Ghi chú | Mảng phẳng (KHÁC UC06 `GET /events/:id/seats` có bọc `ticketModel`). Sắp xếp theo `row`, `number`. Payload không có `ticketTypeId` — FE lấy giá/khu vực từ layout UC06 nếu cần. |
+
+---
+
+### TC-SEL-02 — Ghế đang giữ hiện HELD (sau khi lock UC09)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `GET` |
+| URL | `{{BASE_URL}}/booking/{{EVENT_ID}}/seats` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Điều kiện | Đã `POST /booking/seats/{{SEAT_ID_1}}/lock` thành công (TC-LOCK-01), lock còn TTL |
+| Status | `200 OK` |
+| Response | Item của `SEAT_ID_1` có `"status": "HELD"`; các ghế còn lại `AVAILABLE` |
+| Ghi chú | HELD hiển thị cho **mọi** user xem sơ đồ (không phân biệt ai đang giữ) — phản ánh ghế đang bận. |
+
+---
+
+### TC-SEL-03 — Ghế đã bán hiện SOLD
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `GET` |
+| URL | `{{BASE_URL}}/booking/{{EVENT_ID}}/seats` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Điều kiện | Một ghế có `Seat.status=SOLD` trong DB (qua UC11 thanh toán xong, hoặc set thủ công Prisma Studio) |
+| Status | `200 OK` |
+| Response | Item ghế đó `"status": "SOLD"` |
+| Ghi chú | SOLD (Postgres) ưu tiên hơn HELD. Ghế SOLD đã được UC11 nhả lock nên không còn trong held-set sống. |
+
+---
+
+### TC-SEL-04 — Held-set drift: member rác vẫn ra AVAILABLE (chống HELD oan)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `GET` |
+| URL | `{{BASE_URL}}/booking/{{EVENT_ID}}/seats` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Chuẩn bị | Tạo member rác qua redis-cli: `SADD held:event:{{EVENT_ID}} <SEAT_ID_X>` **nhưng KHÔNG tạo** key `lock:event:{{EVENT_ID}}:seat:<SEAT_ID_X>` (mô phỏng lock hết TTL mà SREM chưa chạy) |
+| Status | `200 OK` |
+| Response | `SEAT_ID_X` có `"status": "AVAILABLE"` (KHÔNG phải HELD) |
+| Ghi chú | Chứng minh read path lọc theo lock key còn sống ⇒ miễn nhiễm held-set drift. Cover tự động: test "merge 4 trạng thái" trong `seat-selection.integration.spec.ts`. |
+
+---
+
+### TC-SEL-05 — Event không tồn tại → 404
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `GET` |
+| URL | `{{BASE_URL}}/booking/00000000-0000-0000-0000-000000000000/seats` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Status | `404 Not Found` |
+| Response | `{ "statusCode": 404, "message": "Sự kiện không tồn tại", "path": "...", "timestamp": "..." }` |
+
+---
+
+### TC-SEL-06 — Không có token → 401
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `GET` |
+| URL | `{{BASE_URL}}/booking/{{EVENT_ID}}/seats` |
+| Status | `401 Unauthorized` |
+| Response | `{ "statusCode": 401, "message": "Token không hợp lệ hoặc đã hết hạn", "path": "...", "timestamp": "..." }` |
+
+---
+
+### TC-SEL-07 — eventId không phải UUID hợp lệ → 400
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `GET` |
+| URL | `{{BASE_URL}}/booking/not-a-uuid/seats` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Status | `400 Bad Request` |
+| Response | `{ "statusCode": 400, "message": "Validation failed (uuid is expected)", "path": "...", "timestamp": "..." }` |
+
+---
+
+### TC-SEL-08 — Event dùng model ZONE (không có ghế) → mảng rỗng
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `GET` |
+| URL | `{{BASE_URL}}/booking/{{EVENT_ID_ZONE}}/seats` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Điều kiện | Event dùng model ZONE (không tạo `Seat` row) |
+| Status | `200 OK` |
+| Response | `[]` |
+| Ghi chú | UC08 chỉ phục vụ SEAT_MAP; màn ZONE của FE dùng endpoint/khác. |
+
+---
+
+> **Auto test:** `src/booking/seat-selection/seat-selection.integration.spec.ts` (3 test, Postgres+Redis thật): merge 4 trạng thái (gồm ca stale-member→AVAILABLE) · click→lock→HELD · event lạ→404. Chạy `npm test -- seat-selection`.
 
 ---
 
