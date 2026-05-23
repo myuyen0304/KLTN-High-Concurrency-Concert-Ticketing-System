@@ -5,6 +5,7 @@ import { ScheduleModule } from '@nestjs/schedule';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { AuthModule } from './auth/auth.module';
+import { OrderModule } from './booking/order/order.module';
 import { SeatLockModule } from './booking/seat-lock/seat-lock.module';
 import { EventsModule } from './events/events.module';
 import { OrganizerModule } from './organizer/organizer.module';
@@ -32,6 +33,7 @@ import { RedisModule } from './redis/redis.module';
     SeatsModule,
     OrganizerModule,
     SeatLockModule,
+    OrderModule,
     QueueModule,
   ],
   controllers: [AppController],
