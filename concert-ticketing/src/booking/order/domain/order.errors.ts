@@ -1,7 +1,6 @@
 export const ORDER_ERROR_CODES = {
   SEAT_HOLD_EXPIRED: 'SEAT_HOLD_EXPIRED',
   ORDER_KEY_CONSUMED: 'ORDER_KEY_CONSUMED',
-  IDEMPOTENCY_KEY_CONFLICT: 'IDEMPOTENCY_KEY_CONFLICT',
   SEAT_NOT_PRICEABLE: 'SEAT_NOT_PRICEABLE',
 } as const;
 
@@ -35,15 +34,6 @@ export class OrderKeyConsumedError extends Error {
   constructor(orderId: string, status: string) {
     super(`Idempotency key already consumed by order ${orderId} (${status})`);
     this.name = 'OrderKeyConsumedError';
-  }
-}
-
-/** The idempotencyKey belongs to a different user (global-unique collision). */
-export class IdempotencyKeyConflictError extends Error {
-  readonly code = ORDER_ERROR_CODES.IDEMPOTENCY_KEY_CONFLICT;
-  constructor() {
-    super('Idempotency key already used by another user');
-    this.name = 'IdempotencyKeyConflictError';
   }
 }
 

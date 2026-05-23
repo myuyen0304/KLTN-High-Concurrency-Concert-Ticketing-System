@@ -17,7 +17,6 @@ import {
 } from './application/ports/order-repository.port';
 import { SEAT_HOLD_PORT } from './application/ports/seat-hold.port';
 import {
-  IdempotencyKeyConflictError,
   OrderKeyConsumedError,
   SeatHoldExpiredError,
   SeatNotPriceableError,
@@ -294,11 +293,11 @@ describe('Order integration (UC10)', () => {
 
     const after = await prisma.order.count({ where: { eventId } });
     expect(after).toBe(before);
-    const orphan = await prisma.order.findUnique({ where: { idempotencyKey } });
+    const orphan = await prisma.order.findFirst({ where: { idempotencyKey } });
     expect(orphan).toBeNull();
   });
 
-  it('cross-user idempotencyKey collision → IDEMPOTENCY_KEY_CONFLICT', async () => {
+  it('same idempotencyKey across different users → independent orders (per-user scope)', async () => {
     const idempotencyKey = `idem-${randomUUID()}`;
     const buyerSeat = seatIds[0];
     const otherSeat = seatIds[1];
@@ -319,22 +318,25 @@ describe('Order integration (UC10)', () => {
       BOOKING_WINDOW_SECONDS,
     );
 
-    await createOrder.execute({
+    const first = await createOrder.execute({
       userId: buyerId,
       eventId,
       seatIds: [buyerSeat],
       idempotencyKey,
     });
 
-    // organizer owns its own seat (verifyHeld passes) but reuses buyer's key
-    await expect(
-      createOrder.execute({
-        userId: organizerUserId,
-        eventId,
-        seatIds: [otherSeat],
-        idempotencyKey,
-      }),
-    ).rejects.toBeInstanceOf(IdempotencyKeyConflictError);
+    // The key is now scoped per user (@@unique([userId, idempotencyKey])), so the
+    // organizer reusing the same key string is NOT a collision — it creates its
+    // own order rather than replaying or conflicting.
+    const second = await createOrder.execute({
+      userId: organizerUserId,
+      eventId,
+      seatIds: [otherSeat],
+      idempotencyKey,
+    });
+
+    expect(second.replayed).toBe(false);
+    expect(second.order.id).not.toBe(first.order.id);
   });
 
   it('replaying a key whose order already EXPIRED → ORDER_KEY_CONSUMED', async () => {

@@ -47,7 +47,10 @@ export interface OrderRepositoryPort {
     confirmHold: () => Promise<void>,
   ): Promise<OrderEntity>;
 
-  findByIdempotencyKey(key: string): Promise<OrderEntity | null>;
+  findByIdempotencyKey(
+    userId: string,
+    key: string,
+  ): Promise<OrderEntity | null>;
 
   /** Compare-and-set: PENDING → EXPIRED. `changed=false` if already settled. */
   markExpiredIfPending(orderId: string): Promise<ExpireResult>;

@@ -88,9 +88,12 @@ export class PrismaOrderAdapter implements OrderRepositoryPort {
     }
   }
 
-  async findByIdempotencyKey(key: string): Promise<OrderEntity | null> {
+  async findByIdempotencyKey(
+    userId: string,
+    key: string,
+  ): Promise<OrderEntity | null> {
     const row = await this.prisma.order.findUnique({
-      where: { idempotencyKey: key },
+      where: { userId_idempotencyKey: { userId, idempotencyKey: key } },
     });
     return row ? this.toEntity(row) : null;
   }

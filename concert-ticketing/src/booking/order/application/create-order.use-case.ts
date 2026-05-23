@@ -3,7 +3,6 @@ import { ConfigService } from '@nestjs/config';
 import { OrderEntity } from '../domain/order.entity';
 import {
   DuplicateOrderError,
-  IdempotencyKeyConflictError,
   OrderKeyConsumedError,
   SeatHoldExpiredError,
 } from '../domain/order.errors';
@@ -93,14 +92,14 @@ export class CreateOrderUseCase {
     idempotencyKey: string,
     userId: string,
   ): Promise<CreateOrderOutput> {
-    const existing = await this.repo.findByIdempotencyKey(idempotencyKey);
+    const existing = await this.repo.findByIdempotencyKey(
+      userId,
+      idempotencyKey,
+    );
     if (!existing) {
       // Lost the unique race but the row vanished (cancelled+pruned) — extremely
       // rare; treat as a fresh conflict so the client retries with a new key.
       throw new OrderKeyConsumedError('unknown', 'GONE');
-    }
-    if (!existing.isOwnedBy(userId)) {
-      throw new IdempotencyKeyConflictError();
     }
     if (!existing.isPending()) {
       throw new OrderKeyConsumedError(existing.id, existing.status);

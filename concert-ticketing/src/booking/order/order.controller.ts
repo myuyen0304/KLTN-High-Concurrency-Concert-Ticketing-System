@@ -20,7 +20,6 @@ import {
 import { CreateOrderUseCase } from './application/create-order.use-case';
 import { OrderEntity } from './domain/order.entity';
 import {
-  IdempotencyKeyConflictError,
   OrderKeyConsumedError,
   SeatHoldExpiredError,
   SeatNotPriceableError,
@@ -45,7 +44,7 @@ export class OrderController {
   })
   @ApiResponse({
     status: 409,
-    description: 'ORDER_KEY_CONSUMED | IDEMPOTENCY_KEY_CONFLICT',
+    description: 'ORDER_KEY_CONSUMED',
   })
   @ApiResponse({
     status: 422,
@@ -75,10 +74,7 @@ export class OrderController {
           message: err.message,
         });
       }
-      if (
-        err instanceof OrderKeyConsumedError ||
-        err instanceof IdempotencyKeyConflictError
-      ) {
+      if (err instanceof OrderKeyConsumedError) {
         throw new ConflictException({ code: err.code, message: err.message });
       }
       throw err;
