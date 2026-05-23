@@ -7,6 +7,7 @@ import { RabbitmqExpirationAdapter } from './adapters/rabbitmq-expiration.adapte
 import { RedisSeatHoldAdapter } from './adapters/redis-seat-hold.adapter';
 import { CreateOrderUseCase } from './application/create-order.use-case';
 import { ExpireOrderUseCase } from './application/expire-order.use-case';
+import { GetOrderStatusUseCase } from './application/get-order-status.use-case';
 import { EXPIRATION_PUBLISHER_PORT } from './application/ports/expiration-publisher.port';
 import { ORDER_REPOSITORY_PORT } from './application/ports/order-repository.port';
 import { SEAT_HOLD_PORT } from './application/ports/seat-hold.port';
@@ -19,6 +20,7 @@ import { OrderTimeoutConsumer } from './timeout/order-timeout.consumer';
   providers: [
     CreateOrderUseCase,
     ExpireOrderUseCase,
+    GetOrderStatusUseCase,
     OrderTimeoutConsumer,
     { provide: ORDER_REPOSITORY_PORT, useClass: PrismaOrderAdapter },
     { provide: SEAT_HOLD_PORT, useClass: RedisSeatHoldAdapter },

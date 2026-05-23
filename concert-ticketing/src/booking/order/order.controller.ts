@@ -2,6 +2,10 @@ import {
   Body,
   ConflictException,
   Controller,
+  Get,
+  NotFoundException,
+  Param,
+  ParseUUIDPipe,
   Post,
   Res,
   UnprocessableEntityException,
@@ -18,6 +22,7 @@ import {
   JwtPayload,
 } from '../../common/decorators/current-user.decorator';
 import { CreateOrderUseCase } from './application/create-order.use-case';
+import { GetOrderStatusUseCase } from './application/get-order-status.use-case';
 import { OrderEntity } from './domain/order.entity';
 import {
   OrderKeyConsumedError,
@@ -30,7 +35,10 @@ import { CreateOrderDto } from './dto/create-order.dto';
 @ApiBearerAuth()
 @Controller('orders')
 export class OrderController {
-  constructor(private readonly createOrderUseCase: CreateOrderUseCase) {}
+  constructor(
+    private readonly createOrderUseCase: CreateOrderUseCase,
+    private readonly getOrderStatusUseCase: GetOrderStatusUseCase,
+  ) {}
 
   @Post()
   @ApiOperation({ summary: 'UC10 — Create a PENDING order from held seats' })
@@ -79,6 +87,32 @@ export class OrderController {
       }
       throw err;
     }
+  }
+
+  @Get(':orderId/status')
+  @ApiOperation({
+    summary: 'UC11 — Poll order status for the confirmation page',
+  })
+  @ApiResponse({
+    status: 200,
+    description: '{ status, totalAmount, ticketsIssued }',
+  })
+  @ApiResponse({ status: 404, description: 'Order not found' })
+  async status(
+    @CurrentUser() user: JwtPayload,
+    @Param('orderId', ParseUUIDPipe) orderId: string,
+  ) {
+    const view = await this.getOrderStatusUseCase.execute({
+      orderId,
+      userId: user.sub,
+    });
+    if (!view) {
+      throw new NotFoundException({
+        code: 'ORDER_NOT_FOUND',
+        message: `Order ${orderId} not found`,
+      });
+    }
+    return view;
   }
 
   private toResponse(order: OrderEntity) {

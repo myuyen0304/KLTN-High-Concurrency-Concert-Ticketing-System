@@ -29,6 +29,12 @@ export interface ExpireResult {
   seatIds: string[];
 }
 
+export interface OrderStatusView {
+  status: string;
+  totalAmount: string;
+  ticketsIssued: boolean;
+}
+
 export interface OrderRepositoryPort {
   /**
    * Loads ticket-type pricing for the given seats of an event.
@@ -57,4 +63,13 @@ export interface OrderRepositoryPort {
 
   /** Audit: mark the seat locks of these seats EXPIRED (vá drift held-set). */
   expireSeatLockAudit(seatIds: string[], userId: string): Promise<void>;
+
+  /**
+   * Confirmation-page poll: order status + whether every seat now has a ticket.
+   * Scoped to the owner; returns null if missing or not owned (no info leak).
+   */
+  findStatusView(
+    orderId: string,
+    userId: string,
+  ): Promise<OrderStatusView | null>;
 }

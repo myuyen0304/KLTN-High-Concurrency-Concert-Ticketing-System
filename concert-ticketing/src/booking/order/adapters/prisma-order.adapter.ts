@@ -10,6 +10,7 @@ import {
   CreateOrderData,
   ExpireResult,
   OrderRepositoryPort,
+  OrderStatusView,
   SeatPricing,
 } from '../application/ports/order-repository.port';
 
@@ -127,6 +128,28 @@ export class PrismaOrderAdapter implements OrderRepositoryPort {
       where: { seatId: { in: seatIds }, userId, status: 'ACTIVE' },
       data: { status: 'EXPIRED', releasedAt: new Date() },
     });
+  }
+
+  async findStatusView(
+    orderId: string,
+    userId: string,
+  ): Promise<OrderStatusView | null> {
+    const order = await this.prisma.order.findFirst({
+      where: { id: orderId, userId },
+      select: {
+        status: true,
+        totalAmount: true,
+        _count: { select: { orderItems: true, tickets: true } },
+      },
+    });
+    if (!order) return null;
+    return {
+      status: order.status,
+      totalAmount: order.totalAmount.toString(),
+      ticketsIssued:
+        order._count.orderItems > 0 &&
+        order._count.tickets >= order._count.orderItems,
+    };
   }
 
   private toEntity(row: {

@@ -328,6 +328,7 @@ model Ticket {
   order Order @relation(fields: [orderId], references: [id])
   seat  Seat  @relation(fields: [seatId], references: [id])
 
+  @@unique([orderId, seatId])
   @@map("tickets")
 }
 
