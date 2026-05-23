@@ -7,6 +7,7 @@ import { AppService } from './app.service';
 import { AuthModule } from './auth/auth.module';
 import { OrderModule } from './booking/order/order.module';
 import { SeatLockModule } from './booking/seat-lock/seat-lock.module';
+import { SeatSelectionModule } from './booking/seat-selection/seat-selection.module';
 import { PaymentModule } from './payment/payment.module';
 import { EventsModule } from './events/events.module';
 import { OrganizerModule } from './organizer/organizer.module';
@@ -34,6 +35,7 @@ import { RedisModule } from './redis/redis.module';
     SeatsModule,
     OrganizerModule,
     SeatLockModule,
+    SeatSelectionModule,
     OrderModule,
     PaymentModule,
     QueueModule,
