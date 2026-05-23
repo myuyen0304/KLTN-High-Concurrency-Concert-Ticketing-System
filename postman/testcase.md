@@ -25,6 +25,32 @@
    - `ORGANIZER_TOKEN` = _(để trống, điền sau khi login organizer)_
    - `EVENT_ID` = _(để trống, điền sau khi tạo event)_
    - `TICKET_TYPE_ID` = _(để trống, điền sau khi tạo ticket type)_
+   - `ORDER_ID` = _(để trống, điền sau khi tạo order)_
+   - `IDEM_KEY` = _(để trống — sinh UUID mới mỗi đơn)_
+
+---
+
+## Trạng thái test theo tiến độ project
+
+> Cập nhật 2026-05-23. Test **chỉ tồn tại cho phần đã implement**; UC chưa làm thì chưa có test.
+
+| Module / UC | BC | Trạng thái code | Test cases | Test tự động |
+|---|---|---|---|---|
+| Auth (UC01–06) | BC1 | ✅ done | TC-AUTH-01..15 | — |
+| Users | BC1 | ✅ done | TC-USER-01..07 | — |
+| Events (public + organizer) | BC2 | ✅ done | TC-EVENT-01..11 | — |
+| Ticket Types | BC2 | ✅ done | TC-TICKET-01..06 | — |
+| Seats (seat-map / zone) | BC2 | ✅ done | TC-SEAT-01..08 | — |
+| Organizer | BC2/BC4 | ✅ done | TC-ORG-01..07 | — |
+| **Seat Lock (UC09)** | BC3 | ✅ done | TC-LOCK-01..13 | `seat-lock.integration.spec.ts` |
+| **Virtual Queue (UC07)** | BC3 | ✅ done | TC-QUEUE-01..09 | `queue.integration.spec.ts` · `queue.auth.e2e.spec.ts` |
+| **Order (UC10)** | BC4 | ✅ done | **TC-ORDER-01..12** | `order.integration.spec.ts` |
+| Seat Selection (UC08) | BC3 | 🔜 chưa làm | — | — |
+| Payment (UC11) | BC5 | 🔜 chưa làm | — | — |
+| Admin duyệt event/organizer (UC20–24) | BC1/BC2 | 🔜 chưa làm | — | — |
+| Notifications | BC6 | 🔜 chưa làm | — | — |
+
+> Event chỉ thành `ACTIVE` (public) sau khi **Admin duyệt** — Admin chưa implement, nên `GET /events` rỗng cho tới khi seed thủ công `status=ACTIVE` qua Prisma Studio.
 
 ---
 
@@ -1123,6 +1149,198 @@ KEYS token:event:<eventId>:user:*    # rồi DEL từng key nếu cần
 
 ---
 
+## Module: Order (UC10)
+
+> **Bối cảnh:** Tạo đơn `PENDING` từ các ghế user **đang giữ** (lock UC09). Idempotency **guard ở tầng DB** — `Order @@unique([userId, idempotencyKey])`: INSERT trong `$transaction`, đụng `P2002` → trả lại đơn cũ (replay) nếu còn `PENDING`. Đồng bộ TTL hold (Redis) chạy **trong cùng transaction** — hold mất ⇒ rollback, không tạo đơn mồ côi (rule 5.1 #3). Timeout tự hủy qua **RabbitMQ DLE** sau `BOOKING_WINDOW_SECONDS` (mặc định 900s) → order `EXPIRED` + nhả ghế. Yêu cầu `Authorization: Bearer {{TOKEN}}`.
+>
+> **Chuẩn bị:**
+> - Chạy xong UC09: `TOKEN` đang giữ ≥1 ghế còn hạn (vd `SEAT_ID_2` thuộc ticket type **đã định giá**).
+> - `idempotencyKey`: client tự sinh, **duy nhất mỗi đơn**. Postman Pre-request Script: `pm.collectionVariables.set('IDEM_KEY', 'idem-' + Date.now() + '-' + Math.floor(Math.random()*1e6))`.
+> - `concert_rabbitmq` đang chạy để nhánh timeout (DLE) hoạt động.
+
+### TC-ORDER-01 — Tạo order thành công (201)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/orders` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Body (JSON) | `{ "eventId": "{{EVENT_ID}}", "seatIds": ["{{SEAT_ID_2}}"], "idempotencyKey": "{{IDEM_KEY}}" }` |
+| Điều kiện | `TOKEN` đang giữ `SEAT_ID_2` (sau TC-LOCK), ghế thuộc ticket type có giá |
+| Status | `201 Created` |
+| Response | `{ "orderId": "uuid", "status": "PENDING", "totalAmount": "500000", "expiresAt": "..." }` |
+| Ghi chú | `totalAmount` = tổng `unitPrice` các ghế, dạng **string decimal**. `expiresAt` = now + `BOOKING_WINDOW_SECONDS`. Lưu `orderId` vào `ORDER_ID`. |
+| Verify DB | `SELECT status FROM orders WHERE id='{{ORDER_ID}}'` = PENDING; `SELECT count(*) FROM order_items WHERE order_id='{{ORDER_ID}}'` = 1 |
+| Verify Redis | `TTL lock:event:{{EVENT_ID}}:seat:{{SEAT_ID_2}}` được gia hạn ≈ `BOOKING_WINDOW_SECONDS` |
+
+---
+
+### TC-ORDER-02 — Replay idempotent (cùng user + cùng key, đơn còn PENDING → 200)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/orders` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Body (JSON) | _y hệt TC-ORDER-01 — cùng `{{IDEM_KEY}}`_ |
+| Điều kiện | Chạy ngay sau TC-ORDER-01 (đơn vẫn PENDING) |
+| Status | `200 OK` |
+| Response | `{ "orderId": "{{ORDER_ID}}", "status": "PENDING", ... }` (trùng đơn cũ) |
+| Verify DB | `SELECT count(*) FROM orders WHERE user_id=<userId> AND idempotency_key='...'` = 1 (KHÔNG tạo đơn mới) |
+
+---
+
+### TC-ORDER-03 — Key đã dùng cho đơn không còn PENDING (409 ORDER_KEY_CONSUMED)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/orders` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Body (JSON) | `{ "eventId": "{{EVENT_ID}}", "seatIds": ["{{SEAT_ID_2}}"], "idempotencyKey": "{{IDEM_KEY}}" }` |
+| Điều kiện | Đơn của `{{IDEM_KEY}}` đã chuyển `EXPIRED`/`CANCELLED` (chờ timeout, hoặc set thủ công qua Prisma Studio) |
+| Status | `409 Conflict` |
+| Response | `{ "statusCode": 409, "message": { "code": "ORDER_KEY_CONSUMED", "message": "Idempotency key already consumed by order ... (EXPIRED)" }, "path": "...", "timestamp": "..." }` |
+| Ghi chú | Client phải retry bằng **key mới** |
+
+---
+
+### TC-ORDER-04 — Ghế chưa giữ / hold đã hết hạn (422 SEAT_HOLD_EXPIRED)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/orders` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Body (JSON) | `{ "eventId": "{{EVENT_ID}}", "seatIds": ["{{SEAT_ID_5}}"], "idempotencyKey": "idem-nohold-1" }` |
+| Điều kiện | `SEAT_ID_5` KHÔNG được `TOKEN` giữ (chưa lock hoặc đã hết TTL) |
+| Status | `422 Unprocessable Entity` |
+| Response | `{ "statusCode": 422, "message": { "code": "SEAT_HOLD_EXPIRED", "message": "Seat hold for ... is expired or not owned by the user" }, "path": "...", "timestamp": "..." }` |
+| Verify DB | Không có order row nào được tạo |
+
+---
+
+### TC-ORDER-05 — Ghế không có ticket type → không định giá được (422 SEAT_NOT_PRICEABLE)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/orders` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Body (JSON) | `{ "eventId": "{{EVENT_ID}}", "seatIds": ["{{SEAT_NO_TT}}"], "idempotencyKey": "idem-notprice-1" }` |
+| Điều kiện | `SEAT_NO_TT` đang được `TOKEN` giữ nhưng `ticketTypeId = null` (ghế chưa gán loại vé) |
+| Status | `422 Unprocessable Entity` |
+| Response | `{ "statusCode": 422, "message": { "code": "SEAT_NOT_PRICEABLE", "message": "Seat ... has no ticket type and cannot be priced" }, "path": "...", "timestamp": "..." }` |
+
+---
+
+### TC-ORDER-06 — Cùng `idempotencyKey` nhưng KHÁC user → đơn độc lập (không xung đột)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/orders` |
+| Header | `Authorization: Bearer {{TOKEN_2}}` |
+| Body (JSON) | `{ "eventId": "{{EVENT_ID}}", "seatIds": ["{{SEAT_ID_1}}"], "idempotencyKey": "{{IDEM_KEY}}" }` |
+| Điều kiện | `TOKEN_2` đang giữ `SEAT_ID_1`; tái dùng đúng `{{IDEM_KEY}}` mà `TOKEN` đã dùng ở TC-ORDER-01 |
+| Status | `201 Created` |
+| Response | `{ "orderId": "<uuid khác ORDER_ID>", "status": "PENDING", ... }` |
+| Ghi chú | Key **scope theo user** (`@@unique([userId, idempotencyKey])`) ⇒ KHÔNG còn lỗi `IDEMPOTENCY_KEY_CONFLICT` (đã gỡ). |
+| Verify DB | 2 row `orders` cùng `idempotency_key` nhưng khác `user_id`, khác `id` |
+
+---
+
+### TC-ORDER-07 — Tạo order không có token (401)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/orders` |
+| Body (JSON) | `{ "eventId": "{{EVENT_ID}}", "seatIds": ["{{SEAT_ID_2}}"], "idempotencyKey": "idem-noauth" }` |
+| Status | `401 Unauthorized` |
+| Response | `{ "statusCode": 401, "message": "Token không hợp lệ hoặc đã hết hạn", "path": "...", "timestamp": "..." }` |
+
+---
+
+### TC-ORDER-08 — Validation: `seatIds` rỗng (400)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/orders` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Body (JSON) | `{ "eventId": "{{EVENT_ID}}", "seatIds": [], "idempotencyKey": "idem-empty" }` |
+| Status | `400 Bad Request` |
+| Response | `{ "statusCode": 400, "message": ["seatIds should not be empty"], "path": "...", "timestamp": "..." }` |
+
+---
+
+### TC-ORDER-09 — Validation: `eventId` không phải UUID (400)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/orders` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Body (JSON) | `{ "eventId": "abc", "seatIds": ["{{SEAT_ID_2}}"], "idempotencyKey": "idem-baduuid" }` |
+| Status | `400 Bad Request` |
+| Response | `{ "statusCode": 400, "message": ["eventId must be a UUID"], "path": "...", "timestamp": "..." }` |
+
+---
+
+### TC-ORDER-10 — Validation: thiếu `idempotencyKey` (400)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` |
+| URL | `{{BASE_URL}}/orders` |
+| Header | `Authorization: Bearer {{TOKEN}}` |
+| Body (JSON) | `{ "eventId": "{{EVENT_ID}}", "seatIds": ["{{SEAT_ID_2}}"] }` |
+| Status | `400 Bad Request` |
+| Response | `{ "statusCode": 400, "message": ["idempotencyKey should not be empty"], "path": "...", "timestamp": "..." }` |
+
+---
+
+### TC-ORDER-11 — Timeout tự hủy đơn PENDING (async qua RabbitMQ DLE)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Cơ chế | Sau `BOOKING_WINDOW_SECONDS`, message `order.expire` dead-letter về `order.timeout.q` → `ExpireOrderUseCase` CAS `PENDING→EXPIRED` + nhả lock + SREM held-set + audit `SeatLock.status=EXPIRED` |
+| Kết quả mong đợi | Order → `EXPIRED`; `lock:event:...:seat:...` biến mất; ghế chọn/khoá lại được |
+| Cách test tay | Khó (chờ 15'). Seed `BOOKING_WINDOW_SECONDS` nhỏ (vd 10s) trong `.env` rồi quan sát |
+| Tự động | Đã cover: `order.integration.spec.ts` — _"timeout cleanup is idempotent: EXPIRED + locks released, second call no-op"_. Chạy `npm test -- order`. |
+| Idempotent | Message redelivery / gọi expire 2 lần → lần 2 no-op (CAS không đổi) |
+
+---
+
+### TC-ORDER-12 — 50 request đồng thời cùng key → đúng 1 order (concurrency)
+
+| Thuộc tính | Giá trị |
+|---|---|
+| Method | `POST` (50 request đồng thời, cùng `idempotencyKey`) |
+| URL | `{{BASE_URL}}/orders` |
+| Kết quả mong đợi | Đúng **1 order** được tạo trong DB; các request còn lại replay/đụng cùng đơn — KHÔNG có double-order |
+| Verify DB | `SELECT count(*) FROM orders WHERE idempotency_key='...'` = 1 |
+| Ghi chú | Guard là `@@unique` ở DB (không phải check-then-act trên Redis). Đã cover: `order.integration.spec.ts` — _"idempotency: 50 concurrent requests with the same key → exactly 1 order"_. |
+
+---
+
+### Kiểm tra Redis/DB UC10
+
+```powershell
+# Đơn vừa tạo
+# (Prisma Studio) bảng orders: status, expiresAt, idempotencyKey — bảng order_items: seatId, unitPrice
+
+# Lock của ghế trong đơn vẫn sống tới khi đơn PAID/EXPIRED
+docker exec -it concert_redis redis-cli -a redis
+TTL  lock:event:<eventId>:seat:<seatId>     # ~ BOOKING_WINDOW_SECONDS sau khi tạo đơn
+
+# Hàng đợi timeout (RabbitMQ) — xem message chờ dead-letter
+# UI: http://localhost:15672 (guest/guest) → Queues → order.timeout.q
+```
+
+---
+
 ## Luồng test hoàn chỉnh (Happy Path)
 
 Thực hiện theo đúng thứ tự:
@@ -1177,9 +1395,15 @@ Q4. GET  /queue/{{EVENT_ID}}/status (TOKEN_3)      → { admitted: false, positi
 29. DELETE /booking/seats/{{SEAT_ID_1}}/lock       → 204, lock được giải phóng
 30. POST /booking/seats/{{SEAT_ID_1}}/lock (TOKEN_2)→ 200, ghế lock lại được
 
+── Bước 5c: Tạo đơn từ ghế đang giữ (UC10) ──
+    [TOKEN vẫn giữ SEAT_ID_2..4 từ bước 27]
+31. POST /orders (TOKEN, seatIds=[SEAT_ID_2], idempotencyKey=<uuid mới>) → 201 PENDING, lưu ORDER_ID
+32. POST /orders (TOKEN, cùng body + cùng key)                           → 200 replay (trùng ORDER_ID)
+33. POST /orders (TOKEN, seatIds=[SEAT_ID_5 chưa giữ], key mới)          → 422 SEAT_HOLD_EXPIRED
+
 ── Bước 6: Security test ──
-31. POST /auth/logout                              → logout user (TOKEN cũ)
-32. GET  /users/me (TOKEN cũ)                      → expect 401 (blacklisted)
+34. POST /auth/logout                              → logout user (TOKEN cũ)
+35. GET  /users/me (TOKEN cũ)                      → expect 401 (blacklisted)
 ```
 
 ---
@@ -1231,4 +1455,7 @@ npx prisma studio
 | Queue admission | Là scheduler chạy mỗi ~2s (KHÔNG trong request join) — phải để `npm run start:dev` chạy; poll `GET /status` để thấy `admitted` chuyển true |
 | Queue CAP & TTL | CAP = `WaitingRoom.maxConcurrent`, token TTL = `WaitingRoom.bookingWindow` (đọc từ DB, không hardcode) |
 | Queue FIFO | Score hàng chờ = `seq` (INCR), KHÔNG dùng timestamp — đảm bảo FIFO tuyệt đối kể cả nhiều pod |
-| Swagger | `http://localhost:3000/api/docs` — có tag `queue` + `seat-lock` |
+| Order idempotency | `idempotencyKey` **scope theo user** (`@@unique([userId, idempotencyKey])`) — cùng key khác user KHÔNG xung đột; cùng user + cùng key → replay đơn PENDING. Lỗi `IDEMPOTENCY_KEY_CONFLICT` đã **gỡ bỏ**. |
+| Order timeout | Tự hủy qua RabbitMQ DLE sau `BOOKING_WINDOW_SECONDS` (mặc định 900s) — cần `concert_rabbitmq` chạy; RabbitMQ UI `http://localhost:15672` |
+| Order price | `totalAmount` là string decimal = tổng `unitPrice` các ghế |
+| Swagger | `http://localhost:3000/api/docs` — có tag `queue` + `seat-lock` + `order` |
